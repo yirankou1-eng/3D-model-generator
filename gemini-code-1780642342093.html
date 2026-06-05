@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>3D 藻类形态距离场生成器 (闭合实体版)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #fff; font-family: sans-serif; }
+        #ui-panel {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(30, 30, 30, 0.85);
+            padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+            z-index: 100; width: 320px;
+        }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-size: 13px; }
+        input[type="range"] { width: 100%; }
+        input[type="file"] { display: block; margin-bottom: 15px; width: 100%; }
+        .value-display { float: right; color: #00ffaa; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+</head>
+<body>
+
+<div id="ui-panel">
+    <div class="control-group">
+        <label>上传透明背景 PNG 图片</label>
+        <input type="file" id="imageInput" accept="image/png">
+    </div>
+    <div class="control-group">
+        <label>实体厚度乘数 (Thickness) <span id="thickVal" class="value-display">1.0</span></label>
+        <input type="range" id="thicknessSlider" min="0.1" max="10.0" step="0.1" value="1.0">
+    </div>
+    <div class="control-group">
+        <label>平滑处理等级 (Smoothing) <span id="smoothVal" class="value-display">2</span></label>
+        <input type="range" id="smoothSlider" min="0" max="10" step="1" value="2">
+    </div>
+</div>
+
+<script>
+    // --- 核心变量 ---
+    let scene, camera, renderer, controls;
+    let solidMesh, geometry, material;
+    let baseDistanceField = [];
+    let imgWidth = 0, imgHeight = 0;
+    const MAX_RESOLUTION = 256; 
+
+    const imageInput = document.getElementById('imageInput');
+    const thicknessSlider = document.getElementById('thicknessSlider');
+    const smoothSlider = document.getElementById('smoothSlider');
+    const thickVal = document.getElementById('thickVal');
+    const smoothVal = document.getElementById('smoothVal');
+
+    // --- 初始化 Three.js 环境 ---
+    function initThreeJS() {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 0, 300);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(0, 100, 200);
+        scene.add(dirLight);
+        const backLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        backLight.position.set(0, -100, -200);
+        scene.add(backLight);
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    // --- 倒角距离变换 (Chamfer Distance Transform) ---
+    function computeDistanceField(imageData, w, h) {
+        const dist = new Float32Array(w * h);
+        const data = imageData.data;
+
+        for (let i = 0; i < w * h; i++) {
+            const alpha = data[i * 4 + 3];
+            dist[i] = alpha < 10 ? 0 : 1e5; 
+        }
+
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const i = y * w + x;
+                if (dist[i] > 0) {
+                    let minD = dist[i];
+                    if (x > 0) minD = Math.min(minD, dist[i - 1] + 1);
+                    if (y > 0) minD = Math.min(minD, dist[i - w] + 1);
+                    if (x > 0 && y > 0) minD = Math.min(minD, dist[i - w - 1] + 1.414);
+                    if (x < w - 1 && y > 0) minD = Math.min(minD, dist[i - w + 1] + 1.414);
+                    dist[i] = minD;
+                }
+            }
+        }
+
+        for (let y = h - 1; y >= 0; y--) {
+            for (let x = w - 1; x >= 0; x--) {
+                const i = y * w + x;
+                if (dist[i] > 0) {
+                    let minD = dist[i];
+                    if (x < w - 1) minD = Math.min(minD, dist[i + 1] + 1);
+                    if (y < h - 1) minD = Math.min(minD, dist[i + w] + 1);
+                    if (x < w - 1 && y < h - 1) minD = Math.min(minD, dist[i + w + 1] + 1.414);
+                    if (x > 0 && y < h - 1) minD = Math.min(minD, dist[i + w - 1] + 1.414);
+                    dist[i] = minD;
+                }
+            }
+        }
+        return dist;
+    }
+
+    // --- 盒式模糊平滑算法 ---
+    function applySmoothing(inputDist, w, h, iterations) {
+        if (iterations === 0) return inputDist;
+        let src = new Float32Array(inputDist);
+        let dst = new Float32Array(w * h);
+
+        for (let iter = 0; iter < iterations; iter++) {
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    let sum = 0, count = 0;
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            const nx = x + dx, ny = y + dy;
+                            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                                sum += src[ny * w + nx];
+                                count++;
+                            }
+                        }
+                    }
+                    dst[y * w + x] = sum / count;
+                }
+            }
+            let temp = src; src = dst; dst = temp; 
+        }
+        return src;
+    }
+
+    // --- 生成或更新实体拓扑几何体 ---
+    function updateGeometry() {
+        if (!baseDistanceField.length) return;
+
+        const thickness = parseFloat(thicknessSlider.value);
+        const smoothLevel = parseInt(smoothSlider.value);
+        const smoothedDist = applySmoothing(baseDistanceField, imgWidth, imgHeight, smoothLevel);
+
+        const pos = geometry.attributes.position;
+
+        for (let i = 0; i < pos.count; i++) {
+            const x = pos.getX(i);
+            const y = pos.getY(i);
+            
+            // 坐标映射到距离场一维数组索引
+            const ix = Math.round((x / imgWidth + 0.5) * (imgWidth - 1));
+            const iy = Math.round((-y / imgHeight + 0.5) * (imgHeight - 1));
+            
+            // 边界约束验证
+            const safeIx = Math.max(0, Math.min(imgWidth - 1, ix));
+            const safeIy = Math.max(0, Math.min(imgHeight - 1, iy));
+            
+            const dist = smoothedDist[safeIy * imgWidth + safeIx];
+            
+            // 读取网格原始极性 (以此区分物理层面的顶和底)
+            const originalZ = pos.getZ(i); 
+            
+            // 依据距离场挤出顶点。由于使用 BoxGeometry，上下表面及其连接的侧面会被同步拉伸
+            if (originalZ > 0) {
+                pos.setZ(i, dist * thickness);
+            } else if (originalZ < 0) {
+                pos.setZ(i, -dist * thickness);
+            } else {
+                // 处理极少情况下 Z=0 的情况
+                pos.setZ(i, 0);
+            }
+        }
+
+        // 重新计算法线以保证光照物理正确
+        geometry.computeVertexNormals();
+        pos.needsUpdate = true;
+    }
+
+    // --- 图像处理与三维重构 ---
+    function processImage(img) {
+        let scale = 1.0;
+        if (img.width > MAX_RESOLUTION || img.height > MAX_RESOLUTION) {
+            scale = MAX_RESOLUTION / Math.max(img.width, img.height);
+        }
+        imgWidth = Math.floor(img.width * scale);
+        imgHeight = Math.floor(img.height * scale);
+
+        const canvas = document.createElement('canvas');
+        canvas.width = imgWidth;
+        canvas.height = imgHeight;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, imgWidth, imgHeight);
+        
+        const imageData = ctx.getImageData(0, 0, imgWidth, imgHeight);
+        baseDistanceField = computeDistanceField(imageData, imgWidth, imgHeight);
+
+        if (solidMesh) scene.remove(solidMesh);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        
+        // 渲染材质配置：使用 Alpha 测试自动剔除纯透明区域
+        material = new THREE.MeshStandardMaterial({
+            map: texture,
+            transparent: true,
+            alphaTest: 0.1, 
+            side: THREE.DoubleSide,
+            roughness: 0.4
+        });
+
+        // 引入单一的 BoxGeometry 确保拓扑水密。初始 Z 轴厚度分配极小值 0.01 避免极性重叠。
+        geometry = new THREE.BoxGeometry(imgWidth, imgHeight, 0.01, imgWidth - 1, imgHeight - 1, 1);
+        
+        // 强制 UV 平面映射，防止长方体侧面贴图出现拉伸扭曲
+        const uvs = geometry.attributes.uv;
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            const x = pos.getX(i);
+            const y = pos.getY(i);
+            uvs.setXY(i, (x / imgWidth) + 0.5, (y / imgHeight) + 0.5);
+        }
+
+        solidMesh = new THREE.Mesh(geometry, material);
+        scene.add(solidMesh);
+
+        camera.position.z = Math.max(imgWidth, imgHeight) * 1.5;
+        updateGeometry();
+    }
+
+    // --- 事件监听绑定 ---
+    imageInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
