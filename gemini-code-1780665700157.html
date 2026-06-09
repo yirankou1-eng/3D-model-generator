@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>3D 藻类形态生成器 (实心与色彩定制版)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #111; color: #fff; font-family: sans-serif; }
+        #ui-panel {
+            position: absolute; top: 10px; left: 10px;
+            background: rgba(30, 30, 30, 0.85);
+            padding: 15px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.5);
+            z-index: 100; width: 340px;
+            max-height: 90vh; overflow-y: auto;
+        }
+        .control-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-size: 13px; }
+        input[type="range"] { width: 100%; }
+        input[type="file"] { display: block; margin-bottom: 15px; width: 100%; }
+        select { width: 100%; padding: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; outline: none; }
+        .value-display { float: right; color: #00ffaa; }
+        hr { border: 0; height: 1px; background: #555; margin: 15px 0; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/exporters/GLTFExporter.js"></script>
+</head>
+<body>
+
+<div id="ui-panel">
+    <div class="control-group">
+        <label>上传透明背景 PNG 图片</label>
+        <input type="file" id="imageInput" accept="image/png">
+    </div>
+
+    <hr>
+    
+    <div class="control-group">
+        <label>颜色模式</label>
+        <select id="colorModeSelect">
+            <option value="original">原图颜色</option>
+            <option value="gray">无颜色 (灰度)</option>
+            <option value="hsv">自定义纯色 (HSV)</option>
+        </select>
+    </div>
+
+    <div id="hsvControls" style="display: none;">
+        <div class="control-group">
+            <label>色相 (Hue) <span id="hueVal" class="value-display">0°</span></label>
+            <input type="range" id="hueSlider" min="0" max="360" step="1" value="0">
+        </div>
+        <div class="control-group">
+            <label>饱和度 (Saturation) <span id="satVal" class="value-display">100%</span></label>
+            <input type="range" id="satSlider" min="0" max="100" step="1" value="100">
+        </div>
+        <div class="control-group">
+            <label>明度 (Value) <span id="valVal" class="value-display">100%</span></label>
+            <input type="range" id="valSlider" min="0" max="100" step="1" value="100">
+        </div>
+    </div>
+
+    <hr>
+
+    <div class="control-group">
+        <label>实体厚度乘数 (Thickness) <span id="thickVal" class="value-display">1.0</span></label>
+        <input type="range" id="thicknessSlider" min="0.1" max="10.0" step="0.1" value="1.0">
+    </div>
+    <div class="control-group">
+        <label>厚度衰减曲线 (Power Exp) <span id="powerVal" class="value-display">0.5</span></label>
+        <input type="range" id="powerSlider" min="0.1" max="1.0" step="0.05" value="0.5">
+    </div>
+    <div class="control-group">
+        <label>边缘闭合收缩 (Edge Pinch) <span id="pinchVal" class="value-display">1.5</span></label>
+        <input type="range" id="pinchSlider" min="0.0" max="5.0" step="0.1" value="1.5">
+    </div>
+    <div class="control-group">
+        <label>平滑处理等级 (Smoothing) <span id="smoothVal" class="value-display">2</span></label>
+        <input type="range" id="smoothSlider" min="0" max="10" step="1" value="2">
+    </div>
+    <div class="control-group">
+        <button id="exportBtn" style="width: 100%; padding: 10px; background: #00ffaa; color: #111; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">导出 GLTF 模型</button>
+    </div>
+</div>
+
+<script>
+    let scene, camera, renderer, controls;
+    let solidMesh, geometry, material;
+    let baseDistanceField = [];
+    let imgWidth = 0, imgHeight = 0;
+    const MAX_RESOLUTION = 256; 
+
+    // 画布资源和颜色缓存
+    let originalCtxImageData = null; 
+    let offscreenCanvas = document.createElement('canvas');
+    let offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+
+    // UI 元素
+    const imageInput = document.getElementById('imageInput');
+    const colorModeSelect = document.getElementById('colorModeSelect');
+    const hsvControls = document.getElementById('hsvControls');
+    
+    const thicknessSlider = document.getElementById('thicknessSlider');
+    const powerSlider = document.getElementById('powerSlider');
+    const pinchSlider = document.getElementById('pinchSlider');
+    const smoothSlider = document.getElementById('smoothSlider');
+    
+    const thickVal = document.getElementById('thickVal');
+    const powerVal = document.getElementById('powerVal');
+    const pinchVal = document.getElementById('pinchVal');
+    const smoothVal = document.getElementById('smoothVal');
+
+    // HSV 辅助函数 (将HSV转换为RGB像素值)
+    function hsvToRgb(h, s, v) {
+        let r, g, b;
+        let i = Math.floor(h * 6);
+        let f = h * 6 - i;
+        let p = v * (1 - s);
+        let q = v * (1 - f * s);
+        let t = v * (1 - (1 - f) * s);
+        switch (i % 6) {
+            case 0: r = v, g = t, b = p; break;
+            case 1: r = q, g = v, b = p; break;
+            case 2: r = p, g = v, b = t; break;
+            case 3: r = p, g = q, b = v; break;
+            case 4: r = t, g = p, b = v; break;
+            case 5: r = v, g = p, b = q; break;
+        }
+        return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+    }
+
+    function initThreeJS() {
+        scene = new THREE.Scene();
+        camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 2000);
+        camera.position.set(0, 0, 300);
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+        scene.add(ambientLight);
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(0, 100, 200);
+        scene.add(dirLight);
+        const backLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        backLight.position.set(0, -100, -200);
+        scene.add(backLight);
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    }
+
+    function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+    }
+
+    function computeDistanceField(imageData, w, h) {
+        const dist = new Float32Array(w * h);
+        const data = imageData.data;
+
+        for (let i = 0; i < w * h; i++) {
+            const alpha = data[i * 4 + 3];
+            dist[i] = alpha === 0 ? 0 : 1e5; 
+        }
+
+        // 倒角距离变换 (Chamfer Distance Transform)
+        for (let y = 0; y < h; y++) {
+            for (let x = 0; x < w; x++) {
+                const i = y * w + x;
+                if (dist[i] > 0) {
+                    let minD = dist[i];
+                    if (x > 0) minD = Math.min(minD, dist[i - 1] + 1);
+                    if (y > 0) minD = Math.min(minD, dist[i - w] + 1);
+                    if (x > 0 && y > 0) minD = Math.min(minD, dist[i - w - 1] + 1.414);
+                    if (x < w - 1 && y > 0) minD = Math.min(minD, dist[i - w + 1] + 1.414);
+                    dist[i] = minD;
+                }
+            }
+        }
+
+        for (let y = h - 1; y >= 0; y--) {
+            for (let x = w - 1; x >= 0; x--) {
+                const i = y * w + x;
+                if (dist[i] > 0) {
+                    let minD = dist[i];
+                    if (x < w - 1) minD = Math.min(minD, dist[i + 1] + 1);
+                    if (y < h - 1) minD = Math.min(minD, dist[i + w] + 1);
+                    if (x < w - 1 && y < h - 1) minD = Math.min(minD, dist[i + w + 1] + 1.414);
+                    if (x > 0 && y < h - 1) minD = Math.min(minD, dist[i + w - 1] + 1.414);
+                    dist[i] = minD;
+                }
+            }
+        }
+        return dist;
+    }
+
+    function applySmoothing(inputDist, w, h, iterations) {
+        if (iterations === 0) return inputDist;
+        let src = new Float32Array(inputDist);
+        let dst = new Float32Array(w * h);
+
+        for (let iter = 0; iter < iterations; iter++) {
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    let sum = 0, count = 0;
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            const nx = x + dx, ny = y + dy;
+                            if (nx >= 0 && nx < w && ny >= 0 && ny < h) {
+                                sum += src[ny * w + nx];
+                                count++;
+                            }
+                        }
+                    }
+                    dst[y * w + x] = sum / count;
+                }
+            }
+            let temp = src; src = dst; dst = temp; 
+        }
+        return src;
+    }
+
+    function updateGeometry() {
+        if (!baseDistanceField.length || !geometry) return;
+
+        const thickness = parseFloat(thicknessSlider.value);
+        const powerExp = parseFloat(powerSlider.value);
+        const pinchOffset = parseFloat(pinchSlider.value);
+        const smoothLevel = parseInt(smoothSlider.value);
+        
+        const smoothedDist = applySmoothing(baseDistanceField, imgWidth, imgHeight, smoothLevel);
+
+        let maxDist = 0.0001;
+        for (let i = 0; i < smoothedDist.length; i++) {
+            if (smoothedDist[i] > maxDist && smoothedDist[i] < 1e4) {
+                maxDist = smoothedDist[i];
+            }
+        }
+
+        const pos = geometry.attributes.position;
+
+        for (let i = 0; i < pos.count; i++) {
+            const x = pos.getX(i);
+            const y = pos.getY(i);
+            
+            const ix = Math.round((x / imgWidth + 0.5) * (imgWidth - 1));
+            const iy = Math.round((-y / imgHeight + 0.5) * (imgHeight - 1));
+            const safeIx = Math.max(0, Math.min(imgWidth - 1, ix));
+            const safeIy = Math.max(0, Math.min(imgHeight - 1, iy));
+            
+            let rawDist = smoothedDist[safeIy * imgWidth + safeIx];
+            if (rawDist > 1e4) rawDist = 0; 
+            
+            let safeDist = Math.max(0, rawDist - pinchOffset);
+
+            const normalizedDist = safeDist / maxDist;
+            const finalDist = Math.pow(normalizedDist, powerExp) * maxDist;
+
+            const originalZ = pos.getZ(i); 
+            
+            if (originalZ > 0) {
+                pos.setZ(i, finalDist * thickness);
+            } else if (originalZ < 0) {
+                pos.setZ(i, -finalDist * thickness);
+            } else {
+                pos.setZ(i, 0);
+            }
+        }
+
+        geometry.computeVertexNormals();
+        pos.needsUpdate = true;
+    }
+
+    function applyColorMode() {
+        if (!originalCtxImageData) return;
+        
+        const mode = colorModeSelect.value;
+        const outData = offscreenCtx.createImageData(imgWidth, imgHeight);
+        const src = originalCtxImageData.data;
+        const dst = outData.data;
+        
+        const hue = parseFloat(document.getElementById('hueSlider').value) / 360.0;
+        const sat = parseFloat(document.getElementById('satSlider').value) / 100.0;
+        const val = parseFloat(document.getElementById('valSlider').value) / 100.0;
+        const rgb = hsvToRgb(hue, sat, val);
+
+        for (let i = 0; i < src.length; i += 4) {
+            dst[i + 3] = src[i + 3]; // 保持透明度通道
+            if (src[i + 3] === 0) continue; 
+            
+            if (mode === 'original') {
+                dst[i] = src[i];
+                dst[i + 1] = src[i + 1];
+                dst[i + 2] = src[i + 2];
+            } else if (mode === 'gray') {
+                // 标准灰度公式计算亮度
+                const gray = 0.299 * src[i] + 0.587 * src[i + 1] + 0.114 * src[i + 2];
+                dst[i] = gray;
+                dst[i + 1] = gray;
+                dst[i + 2] = gray;
+            } else if (mode === 'hsv') {
+                // HSV 纯色映射
+                dst[i] = rgb[0];
+                dst[i + 1] = rgb[1];
+                dst[i + 2] = rgb[2];
+            }
+        }
+        
+        offscreenCtx.putImageData(outData, 0, 0);
+        
+        if (material && material.map) {
+            material.map.needsUpdate = true;
+        }
+    }
+
+    function processImage(img) {
+        let scale = 1.0;
+        if (img.width > MAX_RESOLUTION || img.height > MAX_RESOLUTION) {
+            scale = MAX_RESOLUTION / Math.max(img.width, img.height);
+        }
+        imgWidth = Math.floor(img.width * scale);
+        imgHeight = Math.floor(img.height * scale);
+
+        offscreenCanvas.width = imgWidth;
+        offscreenCanvas.height = imgHeight;
+        offscreenCtx.drawImage(img, 0, 0, imgWidth, imgHeight);
+        
+        const imageData = offscreenCtx.getImageData(0, 0, imgWidth, imgHeight);
+        const data = imageData.data;
+        
+        // 图像二值化与边缘防溢出处理
+        for (let i = 0; i < data.length; i += 4) {
+            if (data[i + 3] >= 128) {
+                data[i + 3] = 255;
+            } else {
+                data[i + 3] = 0;
+                data[i] = 0; data[i+1] = 0; data[i+2] = 0; 
+            }
+        }
+        
+        // 缓存纯净的原始数据用于色彩调整
+        originalCtxImageData = new ImageData(new Uint8ClampedArray(data), imgWidth, imgHeight);
+        
+        // 计算距离场
+        baseDistanceField = computeDistanceField(imageData, imgWidth, imgHeight);
+
+        // 应用当前的色彩模式以渲染到离屏画布
+        applyColorMode();
+
+        if (solidMesh) scene.remove(solidMesh);
+
+        const texture = new THREE.CanvasTexture(offscreenCanvas);
+        texture.encoding = THREE.sRGBEncoding; 
+        
+        material = new THREE.MeshStandardMaterial({
+            map: texture,
+            transparent: false, // 核心实心修正：关闭透明混合，启用深度写入以解决穿模和空心玻璃感
+            alphaTest: 0.5,     // 保留 50% Alpha 截断
+            side: THREE.DoubleSide,
+            roughness: 0.4
+        });
+
+        geometry = new THREE.BoxGeometry(imgWidth, imgHeight, 0.01, imgWidth - 1, imgHeight - 1, 1);
+        
+        const uvs = geometry.attributes.uv;
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+            const x = pos.getX(i);
+            const y = pos.getY(i);
+            uvs.setXY(i, (x / imgWidth) + 0.5, (y / imgHeight) + 0.5);
+        }
+
+        solidMesh = new THREE.Mesh(geometry, material);
+        scene.add(solidMesh);
+
+        camera.position.z = Math.max(imgWidth, imgHeight) * 1.5;
+        updateGeometry();
+    }
+
+    // 事件监听绑定
+    imageInput.addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function(event) {
+            const img = new Image();
+            img.onload = () => processImage(img);
+            img.src = event.target.result;
+        };
+        reader.readAsDataURL(file);
+    });
+
+    colorModeSelect.addEventListener('change', (e) => {
+        hsvControls.style.display = e.target.value === 'hsv' ? 'block' : 'none';
+        applyColorMode();
+    });
+
+    ['hue', 'sat', 'val'].forEach(prefix => {
+        const sliderId = `${prefix}Slider`;
+        const valId = `${prefix}Val`;
+        document.getElementById(sliderId).addEventListener('input', (e) => {
+            const val = e.target.value;
+            document.getElementById(valId).innerText = prefix === 'hue' ? `${val}°` : `${val}%`;
+            applyColorMode();
+        });
+    });
+
+    thicknessSlider.addEventListener('input', (e) => {
+        thickVal.innerText = e.target.value;
+        updateGeometry();
+    });
+
+    powerSlider.addEventListener('input', (e) => {
+        powerVal.innerText = e.target.value;
+        updateGeometry();
+    });
+
+    pinchSlider.addEventListener('input', (e) => {
+        pinchVal.innerText = e.target.value;
+        updateGeometry();
+    });
+
+    smoothSlider.addEventListener('input', (e) => {
+        smoothVal.innerText = e.target.value;
+        updateGeometry();
+    });
+
+    document.getElementById('exportBtn').addEventListener('click', function() {
+        if (!solidMesh) {
+            alert("请先上传图片并生成模型！");
+            return;
+        }
+
+        const exporter = new THREE.GLTFExporter();
+        
+        exporter.parse(solidMesh, function (gltf) {
+            const output = JSON.stringify(gltf, null, 2);
+            const blob = new Blob([output], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.style.display = 'none';
+            link.href = url;
+            link.download = 'Algae_Model.gltf'; 
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }, { binary: false }); 
+    });
+
+    initThreeJS();
+</script>
+</body>
+</html>
